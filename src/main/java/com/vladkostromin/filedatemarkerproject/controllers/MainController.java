@@ -4,14 +4,10 @@ import javafx.application.Platform;
 import javafx.concurrent.Task;
 import javafx.fxml.FXML;
 import javafx.scene.control.*;
+
 import java.io.File;
-import java.io.IOException;
-import java.nio.file.*;
-import java.nio.file.attribute.*;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Optional;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.*;
+import java.util.concurrent.ForkJoinPool;
 
 public class MainController {
 
@@ -25,14 +21,14 @@ public class MainController {
     private TextArea outputTextArea;
 
     @FXML
-    private ProgressBar progressBar;
+    private ProgressIndicator progressIndicator;
 
     private File selectedDirectory;
     private Task<Void> currentTask;
 
     @FXML
     private void handleSelectedDisk() {
-        File selectedDisk;
+        File selectedDisk = null;
 
         String osName = System.getProperty("os.name").toLowerCase();
         if (osName.contains("win")) {
@@ -104,108 +100,74 @@ public class MainController {
 
     private void processFiles(File directory) {
         // Очищаем outputTextArea перед началом сканирования
-        Platform.runLater(() -> outputTextArea.clear());
+        Platform.runLater(() -> {
+            outputTextArea.clear();
+            progressIndicator.setVisible(true);
+        });
 
         currentTask = new Task<>() {
             @Override
             protected Void call() {
                 updateMessage("Сканирование началось...\n");
 
-                long currentTime = System.currentTimeMillis();
+                try {
+                    long currentTime = System.currentTimeMillis();
 
-                long totalFolders = countFolders(directory);
-                AtomicLong processedFolders = new AtomicLong(0);
+                    // Получаем минимальное количество дней
+                    long minDays = 0;
+                    try {
+                        minDays = Long.parseLong(minDaysField.getText());
+                    } catch (NumberFormatException e) {
+                        minDays = 0; // Значение по умолчанию
+                    }
 
-                traverseDirectories(directory, currentTime, totalFolders, processedFolders);
+                    List<String> results = Collections.synchronizedList(new ArrayList<>());
 
-                updateMessage("Сканирование завершено.\n");
+                    int availableProcessors = Runtime.getRuntime().availableProcessors();
+                    ForkJoinPool forkJoinPool = new ForkJoinPool(availableProcessors);
+                    FolderScannerTask rootTask = new FolderScannerTask(directory, currentTime, minDays, results, this);
+
+                    forkJoinPool.invoke(rootTask);
+
+                    if (isCancelled()) {
+                        updateMessage("Сканирование было отменено.\n");
+                    } else {
+                        // После завершения сканирования обновляем интерфейс
+                        for (String message : results) {
+                            updateMessage(message);
+                        }
+
+                        updateMessage("Сканирование завершено.\n");
+                    }
+                } catch (Exception e) {
+                    String errorMessage = "Ошибка во время сканирования: " + e.getMessage() + "\n";
+                    updateMessage(errorMessage);
+                    e.printStackTrace();
+                } finally {
+                    Platform.runLater(() -> progressIndicator.setVisible(false));
+                }
                 return null;
-            }
-
-            private void traverseDirectories(File dir, long currentTime, long totalFolders, AtomicLong processedFolders) {
-                if (isCancelled()) {
-                    return;
-                }
-
-                File[] files = dir.listFiles();
-                if (files != null) {
-                    for (File file : files) {
-                        if (isCancelled()) {
-                            return;
-                        }
-                        if (file.isDirectory()) {
-                            try {
-                                // Получаем дату создания папки
-                                Path path = file.toPath();
-                                BasicFileAttributes attrs = Files.readAttributes(path, BasicFileAttributes.class);
-
-                                FileTime creationTime = attrs.creationTime();
-                                long creationMillis = creationTime.toMillis();
-
-                                // Если время создания недоступно или равно 0, используем время последней модификации
-                                if (creationMillis == 0L) {
-                                    creationMillis = attrs.lastModifiedTime().toMillis();
-                                }
-
-                                long daysSinceCreation = (currentTime - creationMillis) / (24 * 60 * 60 * 1000);
-
-                                // Получаем минимальное количество дней из поля ввода
-                                long minDays;
-                                try {
-                                    minDays = Long.parseLong(minDaysField.getText());
-                                } catch (NumberFormatException e) {
-                                    minDays = 0; // Значение по умолчанию
-                                }
-
-                                if (daysSinceCreation >= minDays) {
-                                    String message = "Папка: \"" + file.getAbsolutePath() + "\", дней с момента создания: " + daysSinceCreation + "\n";
-                                    updateMessage(message);
-                                }
-                            } catch (IOException e) {
-                                String message = "Не удалось получить информацию о папке: " + file.getAbsolutePath() + "\n";
-                                updateMessage(message);
-                            }
-
-                            // Обновляем прогресс
-                            long processed = processedFolders.incrementAndGet();
-                            updateProgress(processed, totalFolders);
-
-                            // Рекурсивный вызов для обхода вложенных папок
-                            traverseDirectories(file, currentTime, totalFolders, processedFolders);
-                        }
-                    }
-                } else {
-                    String message = "Не удалось получить доступ к директории: " + dir.getAbsolutePath() + "\n";
-                    updateMessage(message);
-                }
-            }
-
-            private long countFolders(File dir) {
-                if (isCancelled()) {
-                    return 0;
-                }
-
-                long count = 0;
-                File[] files = dir.listFiles();
-                if (files != null) {
-                    for (File file : files) {
-                        if (isCancelled()) {
-                            return count;
-                        }
-                        if (file.isDirectory()) {
-                            count++;
-                            count += countFolders(file);
-                        }
-                    }
-                }
-                return count;
             }
         };
 
-        progressBar.progressProperty().bind(currentTask.progressProperty());
+        currentTask.setOnFailed(event -> {
+            Throwable ex = currentTask.getException();
+            String errorMessage = "Задача завершилась с ошибкой: " + ex.getMessage() + "\n";
+            Platform.runLater(() -> {
+                outputTextArea.appendText(errorMessage);
+                progressIndicator.setVisible(false);
+            });
+            ex.printStackTrace();
+        });
 
-        currentTask.messageProperty().addListener((obs, oldMessage, newMessage) -> outputTextArea.appendText(newMessage));
+        currentTask.messageProperty().addListener((obs, oldMessage, newMessage) -> {
+            Platform.runLater(() -> outputTextArea.appendText(newMessage));
+        });
 
         new Thread(currentTask).start();
+    }
+
+    private void updateMessage(String message) {
+        Platform.runLater(() -> outputTextArea.appendText(message));
     }
 }
